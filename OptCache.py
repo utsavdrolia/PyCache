@@ -1,6 +1,10 @@
 import collections
 
+import numpy
+import scipy
 from matplotlib import pyplot as plt
+from scipy.stats import skew
+from scipy.stats import kurtosis
 
 from ZipfGenerator import ZipfGenerator
 from pulp import *
@@ -8,42 +12,56 @@ from pulp import *
 
 def missing(key):
     return key
-#
-# def popitem(self):
-#     """Remove and return the `(key, value)` pair least frequently used."""
-#     try:
-#         (key, _), = self.__counter.most_common(1)
-#     except ValueError:
-#         raise KeyError('%s is empty' % self.__class__.__name__)
-#     else:
-#         return (key, self.pop(key))
 
 
 class OptCache(dict):
     """ILP based cache implementation that uses frequency to predict future and optimize cache allocation """
 
-    def __init__(self, interval, **kwargs):
+    def __init__(self, N=5000, priors=None, **kwargs):
         super(OptCache, self).__init__(**kwargs)
         self.__counter = collections.Counter()
-        self.__interval = interval
-        self.__interval_counter = 5
+        self.__interval = 1000
+        self.__prev_opt = 0
+        self.__interval_multiplier = 1
         self.__cache_misses = 0
         self.__currsize = 0
+        self.__reqcounter = 0
 
-        N = 500
+        self.N = N
         cloudcomput_const = 1  # 400 images in 400ms
         network_latency = 70  # ms
         network_bw = 5.0 / 8  # MBps
         request_size = 50.0 / 1000  # MB per image
         nw_lat = network_latency + (request_size / network_bw) * 1000
 
-        self.L = nw_lat + cloudcomput_const * N
+        self.L = nw_lat + cloudcomput_const * self.N
         self.l = 2.0  # 2ms/object
+
+        # Dirichlet prior
+        # If no prior specified, start from scratch:
+        if priors is None:
+            # alpha = 1.0/N
+            alpha = max(0.0005*N, 1)
+            # alpha = 0.1
+            # alpha = 100
+            # alpha = max(0.001*N,1)
+            # alpha = N
+            for n in range(N):
+                self.__counter[n] += alpha
+        else:
+            self.__counter = collections.Counter(priors)
+            max_val = max(self.__counter.values())
+            # scale the previous counter values such that max is hundred
+            for k in self.__counter.keys():
+                self.__counter[k] = int(((self.__counter[k]/max_val) * 100)) + 1
+
+        self.__reqcounter += sum(self.__counter.values())
+        self.__x_vars = LpVariable.dicts("x", self.__counter.keys(), 0, 1, cat='Integer')
 
     def __getitem__(self, key):
         # Increase requests for key
         self.__counter[key] += 1
-
+        self.__reqcounter += 1
         # CHeck if in cache
         if key not in self:
             # If not get from missing and BUT DO NOT insert
@@ -53,12 +71,12 @@ class OptCache(dict):
             value = super(OptCache, self).__getitem__(key)
 
         # Check if interval reached
-        if sum(self.__counter.values()) % self.__interval == 0:
+        count = self.__reqcounter
+        if (count - self.__prev_opt) >= (self.__interval*self.__interval_multiplier):
             self.optimize_cache()
-        # if sum(self.__counter.values()) % (self.__interval * self.__interval_counter) == 0:
-        #     self.optimize_cache()
-            # if self.__interval_counter != 1:
-            #     self.__interval_counter -= 1
+            self.__prev_opt = count
+            if self.__interval_multiplier != 1:
+                self.__interval_multiplier -= 1
 
         return value
 
@@ -76,35 +94,40 @@ class OptCache(dict):
         return float(freqs[1][1])/freqs[0][1]
 
     def optimize_cache(self):
-        print ("Total requests:{}".format(sum(self.__counter.values())))
+        x_vars = self.__x_vars
+        print ("Total requests:{}".format(self.__reqcounter))
         prob = LpProblem(name="Cache", sense=LpMinimize)
-        x_vars = LpVariable.dicts("x", self.__counter.keys(), 0, 1, cat='Integer')
         costfunction = self.create_cost_fx(x_vars)
         prob.setObjective(costfunction)
         prob.solve()
-        print("Status:", LpStatus[prob.status])
+        self.allocate_cache(x_vars)
+        print ("Cache Size:{}".format(len(self)))
+        print("Status:{}".format(prob.status))
+        print("Solution time:{}".format(prob.solutionTime))
+
+    def allocate_cache(self, x_vars):
         for key in self.__counter.keys():
             if value(x_vars[key]) == 1 and key not in self:
                 super(OptCache, self).__setitem__(key, missing(key))
             elif value(x_vars[key]) == 0 and key in self:
                 super(OptCache, self).__delitem__(key)
 
-        print ("Cache Size:{}".format(len(self)))
-
     def create_cost_fx(self, x_vars):
         exps = []
+
         # sigma(x_i(l-L*p_i) + L*p_i)
         for key in self.__counter.keys():
-            p_i = float(self.__counter[key]) / sum(self.__counter.values())
+            p_i = float(self.__counter[key]) / self.__reqcounter
             Lp_i = self.L * p_i
             exps.append(LpAffineExpression(e=[(x_vars[key], self.l - Lp_i)], constant=Lp_i))
         costfunction = lpSum(exps)
         return costfunction
 
+    def getmaxsize(self):
+        return int(self.L/self.l)
+
 
 if __name__ == '__main__':
-    import numpy as np
-    from scipy.stats import zipf
     cache = OptCache(100)
     num = 10000
     z = ZipfGenerator(300, 0.8)
